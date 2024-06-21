@@ -6,7 +6,6 @@ import { log } from "@/lib/utils"
 
 export function OrderBook() {
   const {bids, asks} = useOrderbook()
-  // log('render')
 
   return <div className=" bg-black text-gray-400">
      <table>

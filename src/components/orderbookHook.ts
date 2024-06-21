@@ -1,12 +1,9 @@
+import { MesssageType, OrderbookItem, OrderbookTotalItem } from '@/lib/types'
 import { log } from '@/lib/utils'
 import { Centrifuge, PublicationContext } from 'centrifuge'
 import { MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { throttle } from 'lodash'
 
-// price, amount, total
-type OrderbookItem = [string, string]
-type OrderbookTotalItem = [string, string, string]
-
+// Function to calculate cumulative totals for orderbook items
 function itemsWithTotal(items: [string, string][]) {
   const result = []
   let prev = 0
@@ -24,135 +21,65 @@ export function useOrderbook() {
   const [bids, setBids] = useState<OrderbookTotalItem[]>([])
   const asksRef = useRef<OrderbookItem[]>([])
   const bidsRef = useRef<OrderbookItem[]>([])
-  const sequenceRef = useRef<number>(0)
+
+  const workerRef = useRef<Worker | null>(null)
   const frameIdRef = useRef<number | null>(null)
-  const updateQueueRef = useRef<PublicationContext[]>([])
   const updateTimeRef = useRef(0)
   
   useEffect(() => {
     init()
     return () => {
+      // Cleanup on component unmount
       if (frameIdRef.current) {
         cancelAnimationFrame(frameIdRef.current)
       }
     }
   }, [])
 
+  // Initialize Web Worker and set up message handling
   const init = () => {
-    // connect websocket
-    const centrifuge = new Centrifuge('wss://api.prod.rabbitx.io/ws', {
-      token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MDAwMDAwMDAwIiwiZXhwIjo2NTQ4NDg3NTY5fQ.o_qBZltZdDHBH3zHPQkcRhVBQCtejIuyq8V1yj5kYq8",
-    })
-    centrifuge.connect()
+    workerRef.current = new Worker(new URL('@/lib/worker.ts', import.meta.url))
+    workerRef.current.postMessage({ type: MesssageType.Run, data: {} })
 
-    // subscribe orderbook
-    const sub = subscribeOrderbook(centrifuge)
-
-    // process update queue
-    processUpdateQueue()
-  }
-
-  const subscribeOrderbook = (centrifuge: Centrifuge) => {
-    const sub = centrifuge.newSubscription('orderbook:BTC-USD')
-
-    // initial orderbook data
-    sub.on('subscribed', ctx => {
-      asksRef.current = ctx.data.asks
-      bidsRef.current = ctx.data.bids
-      sequenceRef.current = ctx.data.sequence
-      // set initial asks data
-      setUIData()
-    })
-
-    // update orderbook data
-    sub.on('publication', ctx => {
-      if (ctx.data.sequence !== sequenceRef.current + 1) {
-        // If sequence is not continuous, resubscribe
-        sub.unsubscribe()
-        if (frameIdRef.current) {
-          // remove reference
-          cancelAnimationFrame(frameIdRef.current)
-          frameIdRef.current = null
-        }
-        subscribeOrderbook(centrifuge)
-      } else {
-        sequenceRef.current = ctx.data.sequence
-        // update data enqueue
-        updateQueueRef.current.push(ctx)
+    workerRef.current.onmessage = (event) => {
+      const { type, bids, asks } = event.data
+      asksRef.current = asks
+      bidsRef.current = bids
+      if (type === MesssageType.Update) {
+        // Handle incremental updates
+        renderUI()
+      } else if (type === MesssageType.Snapshot) {
+        // Handle initial snapshot
+        setUIData()
       }
-    })
-
-    sub.subscribe()
-
-    return sub
+    }
   }
 
-  const processUpdateQueue = () => {
+  // Schedule UI updates using requestAnimationFrame
+  const renderUI = () => {
     if (frameIdRef.current) {
       cancelAnimationFrame(frameIdRef.current)
     }
 
     frameIdRef.current = requestAnimationFrame(() => {
-      if (updateQueueRef.current.length > 0) {
-        const ctx = updateQueueRef.current.shift()!
-        // update ref
-        updateRefItems(ctx.data.asks, asksRef)
-        updateRefItems(ctx.data.bids, bidsRef)
-
-        // delay render UI
-        const now = Date.now()
-        if (now - updateTimeRef.current > 200) {
-          setUIData()
-        }
+      // Throttle UI updates to every 200ms
+      const now = Date.now()
+      if (now - updateTimeRef.current > 200) {
         updateTimeRef.current = now
+        setUIData()
       }
-      // next loop
-      processUpdateQueue()
+      renderUI()
     })
   }
 
+  // Update the React state with the latest orderbook data
   const setUIData = () => {
     let askItems = itemsWithTotal(asksRef.current)
     askItems = askItems.reverse()
     setAsks(askItems)
 
-    let bidItems = itemsWithTotal(bidsRef.current)
+    let bidItems = itemsWithTotal(asksRef.current)
     setBids(bidItems)
-  }
-
-  const updateRefItems = (updateItems: OrderbookItem[], refItems: MutableRefObject<OrderbookItem[]>) => {
-    let newItems: OrderbookItem[] = refItems.current.slice()
-
-    for (const u of updateItems) {
-      let [price, amount] = u
-      price = String(Math.floor(Number(price)))
-
-      const index = newItems.findIndex(item => item[0] === price)
-      if (index >= 0) {
-        // replace price
-        if (Number(amount) > 0) {
-          newItems[index][1] = amount
-        } else {
-          newItems.splice(index, 1)
-        }
-      } else {
-        // insert to newItems
-        if (Number(amount) > 0) {
-          let inserted = false
-          for (let i = 0; i < newItems.length; i++) {
-            if (Number(price) < Number(newItems[i][0])) {
-              newItems.splice(i, 0, [price, amount])
-              inserted = true
-              break
-            }
-          }
-          if (!inserted) {
-            newItems.push([price, amount])
-          }
-        }
-      }
-    }
-    refItems.current = newItems
   }
 
   return {
